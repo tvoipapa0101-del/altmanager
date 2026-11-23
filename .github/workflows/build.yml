@@ -1,0 +1,279 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+      - name: Create project files
+        run: |
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+              }
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.3
+          loader_version=0.18.1
+          fabric_version=0.141.6+1.21.11
+          mod_version=1.0.0
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+          version = project.mod_version
+          base { archivesName = 'altmanager' }
+          repositories {}
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+          tasks.withType(JavaCompile).configureEach { options.release = 21 }
+          java { sourceCompatibility = JavaVersion.VERSION_21; targetCompatibility = JavaVersion.VERSION_21 }
+          EOF_FILE
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'EOF_FILE'
+          {
+            "schemaVersion": 1,
+            "id": "altmanager",
+            "version": "${version}",
+            "name": "Alt Manager",
+            "description": "Менеджер ников + быстрый вход на gaga.reallyworld.ru",
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": { "client": ["com.altmanager.AltManagerMod"] },
+            "mixins": ["altmanager.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "fabric-api": "*",
+              "minecraft": "~1.21.11",
+              "java": ">=21"
+            }
+          }
+          EOF_FILE
+          mkdir -p src/main/resources
+          cat > src/main/resources/altmanager.mixins.json <<'EOF_FILE'
+          {
+            "required": true,
+            "package": "com.altmanager.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["MinecraftClientAccessor"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/altmanager/mixin
+          cat > src/main/java/com/altmanager/mixin/MinecraftClientAccessor.java <<'EOF_FILE'
+          package com.altmanager.mixin;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.session.Session;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Mutable;
+          import org.spongepowered.asm.mixin.gen.Accessor;
+
+          // Только accessor (без @Inject) - не конфликтует с миксинами других модов.
+          @Mixin(MinecraftClient.class)
+          public interface MinecraftClientAccessor {
+              @Mutable
+              @Accessor("session")
+              void altmanager$setSession(Session session);
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/altmanager
+          cat > src/main/java/com/altmanager/AltStorage.java <<'EOF_FILE'
+          package com.altmanager;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class AltStorage {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("altmanager.json");
+
+              public static class Data {
+                  public List<String> alts = new ArrayList<>();
+              }
+
+              public static Data data = new Data();
+
+              public static void load() {
+                  try {
+                      if (Files.exists(FILE)) {
+                          Data d = GSON.fromJson(Files.readString(FILE), Data.class);
+                          if (d != null && d.alts != null) data = d;
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(FILE, GSON.toJson(data));
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/altmanager
+          cat > src/main/java/com/altmanager/AltManagerMod.java <<'EOF_FILE'
+          package com.altmanager;
+
+          import com.altmanager.mixin.MinecraftClientAccessor;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.Screens;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.screen.TitleScreen;
+          import net.minecraft.client.gui.screen.multiplayer.MultiplayerScreen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.session.Session;
+          import net.minecraft.text.Text;
+
+          import java.nio.charset.StandardCharsets;
+          import java.util.Optional;
+          import java.util.UUID;
+
+          public class AltManagerMod implements ClientModInitializer {
+              public static final String SERVER_IP = "gaga.reallyworld.ru";
+
+              @Override
+              public void onInitializeClient() {
+                  AltStorage.load();
+
+                  ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+                      if (screen instanceof TitleScreen || screen instanceof MultiplayerScreen) {
+                          ButtonWidget b = ButtonWidget.builder(Text.literal("Alts"),
+                                          btn -> client.setScreen(new AltScreen(screen)))
+                                  .dimensions(5, 5, 50, 20).build();
+                          Screens.getButtons(screen).add(b);
+                      }
+                  });
+              }
+
+              public static void applyOffline(String name) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  UUID uuid = UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
+                  Session s = new Session(name, uuid, "0", Optional.empty(), Optional.empty());
+                  ((MinecraftClientAccessor) mc).altmanager$setSession(s);
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/altmanager
+          cat > src/main/java/com/altmanager/AltScreen.java <<'EOF_FILE'
+          package com.altmanager;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.ConnectScreen;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.client.network.ServerAddress;
+          import net.minecraft.client.network.ServerInfo;
+          import net.minecraft.text.Text;
+
+          import java.util.List;
+
+          public class AltScreen extends Screen {
+              private final Screen parent;
+              private TextFieldWidget nameField;
+
+              public AltScreen(Screen parent) {
+                  super(Text.literal("Alt Manager"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  nameField = new TextFieldWidget(this.textRenderer, cx - 100, 40, 140, 20, Text.literal("Ник"));
+                  nameField.setMaxLength(16);
+                  nameField.setPlaceholder(Text.literal("Новый ник"));
+                  addDrawableChild(nameField);
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Добавить"), b -> {
+                      String n = nameField.getText().trim();
+                      if (n.matches("[A-Za-z0-9_]{3,16}") && !AltStorage.data.alts.contains(n)) {
+                          AltStorage.data.alts.add(n);
+                          AltStorage.save();
+                          this.clearAndInit();
+                      }
+                  }).dimensions(cx + 45, 40, 55, 20).build());
+
+                  List<String> alts = AltStorage.data.alts;
+                  int y = 70;
+                  for (int i = 0; i < Math.min(alts.size(), 8); i++) {
+                      final String name = alts.get(i);
+                      addDrawableChild(ButtonWidget.builder(Text.literal(name), b -> {
+                          AltManagerMod.applyOffline(name);
+                      }).dimensions(cx - 100, y, 170, 20).build());
+                      addDrawableChild(ButtonWidget.builder(Text.literal("X"), b -> {
+                          AltStorage.data.alts.remove(name);
+                          AltStorage.save();
+                          this.clearAndInit();
+                      }).dimensions(cx + 75, y, 25, 20).build());
+                      y += 24;
+                  }
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Зайти на " + AltManagerMod.SERVER_IP), b -> {
+                      MinecraftClient mc = MinecraftClient.getInstance();
+                      ServerAddress addr = ServerAddress.parse(AltManagerMod.SERVER_IP);
+                      ServerInfo info = new ServerInfo("ReallyWorld", AltManagerMod.SERVER_IP, ServerInfo.ServerType.OTHER);
+                      ConnectScreen.connect(this, mc, addr, info, false, null);
+                  }).dimensions(cx - 100, this.height - 52, 200, 20).build());
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Назад"), b -> close())
+                          .dimensions(cx - 100, this.height - 28, 200, 20).build());
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  super.render(ctx, mouseX, mouseY, delta);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, 15, 0xFFFFFFFF);
+                  String cur = MinecraftClient.getInstance().getSession().getUsername();
+                  ctx.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Текущий ник: " + cur),
+                          this.width / 2, 27, 0xFFAAAAAA);
+              }
+
+              @Override
+              public void close() {
+                  MinecraftClient.getInstance().setScreen(parent);
+              }
+          }
+          EOF_FILE
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: altmanager-jar
+          path: build/libs/*.jar
+
